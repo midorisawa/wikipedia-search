@@ -1,0 +1,9 @@
+[project]
+name = "jawiki-sqlite"
+version = "0.1.0"
+description = "Wikimedia日本語版のXMLダンプをSQLiteへ変換するローカルツール"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
