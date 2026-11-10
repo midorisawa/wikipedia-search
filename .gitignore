@@ -3,4 +3,6 @@ data/
 *.sqlite.partial
 *.sqlite-shm
 *.sqlite-wal
+*.update.lock
+*.xml.bz2.lock
 __pycache__/

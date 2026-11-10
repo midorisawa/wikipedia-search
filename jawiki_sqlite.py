@@ -6,9 +6,12 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
+import tempfile
 import time
 import urllib.request
 import xml.etree.ElementTree as ET
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -136,18 +139,46 @@ def sha1_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+@contextmanager
+def exclusive_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"ロックを取得できない: {path}") from exc
+        yield
+
+
 def download_dump(info: dict[str, object], output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
     final_path = output_dir / str(info["filename"])
+    if final_path.exists():
+        return reuse_dump(info, final_path)
+    with exclusive_lock(final_path.with_name(final_path.name + ".lock")):
+        return download_dump_locked(info, final_path)
+
+
+def reuse_dump(info: dict[str, object], final_path: Path) -> Path:
+    if final_path.stat().st_size != int(info["size"]) or sha1_file(final_path) != str(info["sha1"]):
+        raise RuntimeError(f"検証に失敗した既存ファイルがある: {final_path}")
+    print(f"取得済みファイルを再利用: {final_path}")
+    return final_path
+
+
+def download_dump_locked(info: dict[str, object], final_path: Path) -> Path:
     partial_path = final_path.with_suffix(final_path.suffix + ".part")
     expected_size = int(info["size"])
     expected_sha1 = str(info["sha1"])
 
     if final_path.exists():
-        if final_path.stat().st_size == expected_size and sha1_file(final_path) == expected_sha1:
-            print(f"取得済みファイルを再利用: {final_path}")
-            return final_path
-        raise RuntimeError(f"検証に失敗した既存ファイルがある: {final_path}")
+        return reuse_dump(info, final_path)
 
     downloaded = partial_path.stat().st_size if partial_path.exists() else 0
     if downloaded > expected_size:
@@ -294,6 +325,24 @@ def read_siteinfo(siteinfo: ET.Element) -> tuple[dict[str, str], list[tuple[int,
 
 
 def import_dump(
+    dump_path: Path,
+    database_path: Path,
+    *,
+    source_info: dict[str, object] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    restart: bool = False,
+) -> None:
+    with database_write_lock(database_path):
+        import_dump_locked(
+            dump_path, database_path, source_info=source_info, batch_size=batch_size, restart=restart
+        )
+
+
+def database_write_lock(database_path: Path):
+    return exclusive_lock(database_path.with_name(database_path.name + ".update.lock"))
+
+
+def import_dump_locked(
     dump_path: Path,
     database_path: Path,
     *,
@@ -449,11 +498,10 @@ def database_summary(connection: sqlite3.Connection, *, full: bool = False) -> d
 
 def verify_database(database_path: Path, *, full: bool = False) -> dict[str, object]:
     uri = database_path.resolve().as_uri() + "?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
-    quick_check = connection.execute("PRAGMA quick_check").fetchone()[0] if full else "省略"
-    summary = database_summary(connection, full=full)
-    metadata = dict(connection.execute("SELECT key, value FROM metadata"))
-    connection.close()
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()[0] if full else "省略"
+        summary = database_summary(connection, full=full)
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
     if full and quick_check != "ok":
         raise RuntimeError(f"SQLite quick_check失敗: {quick_check}")
     if int(metadata.get("page_count", "-1")) != summary["page_count"]:
@@ -489,6 +537,45 @@ def print_summary(summary: dict[str, object]) -> None:
         print(f"  {namespace_id:>4} {label}: {count:,}")
 
 
+def update_database(database_path: Path, output_dir: Path) -> None:
+    with database_write_lock(database_path):
+        update_database_locked(database_path, output_dir)
+
+
+def check_database_sidecars(database_path: Path) -> None:
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = database_path.with_name(database_path.name + suffix)
+        if sidecar.exists():
+            raise RuntimeError(
+                f"SQLiteの補助ファイルが残っている: {sidecar}。"
+                "DBをSQLiteで読み書き可能な状態で開いて正常に閉じてから再実行する"
+            )
+
+
+def update_database_locked(database_path: Path, output_dir: Path) -> None:
+    info = resolve_dump("latest")
+    if database_path.exists():
+        uri = database_path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            row = connection.execute("SELECT value FROM metadata WHERE key = 'source_file'").fetchone()
+        source = re.fullmatch(r"jawiki-([0-9]{8})-pages-meta-current\.xml\.bz2", row[0]) if row else None
+        if source and source[1] >= str(info["date"]):
+            print(f"更新不要: 現在のDBは{source[1]}版、最新公開ダンプは{info['date']}版")
+            return
+
+    check_database_sidecars(database_path)
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+    dump_path = download_dump(info, output_dir)
+    with tempfile.TemporaryDirectory(prefix=".jawiki-update-", dir=database_path.parent) as directory:
+        staged_path = Path(directory) / database_path.name
+        import_dump_locked(dump_path, staged_path, source_info=info)
+        summary = verify_database(staged_path)
+        check_database_sidecars(database_path)
+        staged_path.replace(database_path)
+    print_summary(summary)
+    print(f"{info['date']}版に更新: {database_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Wikipedia日本語版をSQLiteへ格納する")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -508,6 +595,10 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--output-dir", type=Path, default=Path("data"))
     build.add_argument("--database", type=Path, default=Path("jawiki.sqlite"))
     build.add_argument("--restart", action="store_true", help="未完成DBを破棄して再変換する")
+
+    update = subparsers.add_parser("update", help="最新公開ダンプでSQLiteを更新する")
+    update.add_argument("--output-dir", type=Path, default=Path("data"))
+    update.add_argument("--database", type=Path, default=Path("jawiki.sqlite"))
 
     query = subparsers.add_parser("get", help="タイトル完全一致でページを表示する")
     query.add_argument("database", type=Path)
@@ -536,6 +627,8 @@ def main(argv: list[str] | None = None) -> None:
         dump_path = download_dump(info, args.output_dir)
         import_dump(dump_path, args.database, source_info=info, restart=args.restart)
         print_summary(verify_database(args.database))
+    elif args.command == "update":
+        update_database(args.database, args.output_dir)
     elif args.command == "get":
         query_title(args.database, args.title, args.namespace)
     elif args.command == "verify":

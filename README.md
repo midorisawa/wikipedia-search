@@ -28,6 +28,18 @@ uv run python .\jawiki_sqlite.py build --date 20260701 --database .\jawiki.sqlit
 uv run python .\jawiki_sqlite.py import .\data\jawiki-20260701-pages-meta-current.xml.bz2 .\jawiki.sqlite
 ```
 
+## 更新
+
+リポジトリのディレクトリで次のコマンドを実行すると、Wikimediaの最新公開ダンプを確認し、新しい版があれば`jawiki.sqlite`を更新する。DBがまだなければ新規作成する。
+
+```powershell
+uv run python .\jawiki_sqlite.py update
+```
+
+更新時は、`data`にダンプを取得し、別の場所に新しいDBを構築する。ページ件数の検証が通ってから`jawiki.sqlite`を差し替える。差し替えまで既存のDBも残るため、新しいDBとダンプを保存できる空き容量を確保し、DBを開いているアプリを閉じてから実行する。
+
+別のDBを更新する場合は`--database`、ダンプの保存先を指定する場合は`--output-dir`を使う。
+
 ## 利用
 
 記事「日本」をタイトル完全一致で取得する:
